@@ -1,0 +1,21 @@
+# Build output
+dist/
+build/
+*.spec
+__pycache__/
+*.pyc
+*.pyo
+
+# Transfer progress
+.transfer_progress.json
+*.transfer_resume
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store
