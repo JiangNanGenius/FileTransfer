@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-超大文件断点续传搬运器 v2.2
-支持: 大文件分块传输、断点续传、重试机制、心跳检测、进度管理、高DPI自适应
+超大文件断点续传搬运器 v3.0
+支持: 大文件分块传输、目录级批量传输、断点续传、重试机制、心跳检测、进度管理、高DPI自适应
 """
 
 import os
@@ -127,6 +127,41 @@ class TransferProgress:
     def is_completed(self, file_key: str) -> bool:
         """检查是否已完成"""
         return self.progress.get(file_key, {}).get('completed', False)
+    
+    def set_directory_info(self, dir_key: str, total_files: int, total_size: int):
+        """设置目录传输信息"""
+        if '__directory__' not in self.progress:
+            self.progress['__directory__'] = {}
+        self.progress['__directory__'][dir_key] = {
+            'total_files': total_files,
+            'total_size': total_size,
+            'completed_files': [],
+            'failed_files': []
+        }
+        self.save()
+    
+    def mark_file_complete(self, dir_key: str, file_path: str):
+        """标记目录中的单个文件完成"""
+        if '__directory__' not in self.progress:
+            self.progress['__directory__'] = {}
+        if dir_key not in self.progress['__directory__']:
+            self.progress['__directory__'][dir_key] = {
+                'total_files': 0, 'total_size': 0, 'completed_files': [], 'failed_files': []
+            }
+        if file_path not in self.progress['__directory__'][dir_key]['completed_files']:
+            self.progress['__directory__'][dir_key]['completed_files'].append(file_path)
+            self.save()
+    
+    def get_directory_progress(self, dir_key: str) -> dict:
+        """获取目录传输进度"""
+        if '__directory__' not in self.progress:
+            return {}
+        return self.progress['__directory__'].get(dir_key, {
+            'total_files': 0,
+            'total_size': 0,
+            'completed_files': [],
+            'failed_files': []
+        })
 
 
 class FileTransfer:
@@ -442,6 +477,232 @@ class FileTransfer:
         return {'success': False, 'failed_chunks': failed_chunks, 'file': src_path}
 
 
+class DirectoryTransfer:
+    """目录级多文件断点续传（支持几万文件批量传输）"""
+    
+    def __init__(self, progress_callback=None, status_callback=None, log_callback=None, file_progress_callback=None):
+        self.file_transfer = FileTransfer(progress_callback, status_callback, log_callback)
+        self.progress_callback = progress_callback
+        self.status_callback = status_callback
+        self.log_callback = log_callback
+        self.file_progress_callback = file_progress_callback  # 单个文件进度回调
+        self._is_paused = False
+        self._is_stopped = False
+        self._lock = threading.Lock()
+        # 大文件跳过分块阈值（小于 1MB 的文件直接复制，不分块）
+        self.SKIP_CHUNK_THRESHOLD = 1024 * 1024
+    
+    def get_dir_key(self, src_dir: str, dst_dir: str) -> str:
+        """生成目录传输唯一标识"""
+        src = os.path.abspath(src_dir)
+        dst = os.path.abspath(dst_dir)
+        key_str = f"{src}_{dst}"
+        return hashlib.md5(key_str.encode()).hexdigest()
+    
+    def scan_directory(self, src_dir: str) -> Tuple[List[str], int, int]:
+        """快速扫描目录，返回文件列表、总文件数、总大小
+        使用 os.scandir 代替 os.walk，提升几万文件的扫描性能
+        """
+        file_list = []
+        total_size = 0
+        
+        def _scan(path: str):
+            try:
+                with os.scandir(path) as entries:
+                    for entry in entries:
+                        if self._is_stopped:
+                            return
+                        try:
+                            if entry.is_file(follow_symlinks=False):
+                                file_list.append(entry.path)
+                                total_size += entry.stat().st_size
+                            elif entry.is_dir(follow_symlinks=False):
+                                _scan(entry.path)
+                        except (PermissionError, OSError):
+                            # 跳过无权限的文件/目录
+                            if self.log_callback:
+                                self.log_callback(f"[跳过] 无权限访问: {entry.path}")
+            except (PermissionError, OSError):
+                if self.log_callback:
+                    self.log_callback(f"[跳过] 无法访问目录: {path}")
+        
+        if self.log_callback:
+            self.log_callback(f"[扫描] 正在扫描目录: {src_dir}")
+        
+        _scan(src_dir)
+        
+        if self.log_callback:
+            self.log_callback(f"[扫描] 完成! 共发现 {len(file_list)} 个文件, 总大小: {format_file_size(total_size)}")
+        
+        return file_list, len(file_list), total_size
+    
+    def fast_copy_file(self, src_path: str, dst_path: str) -> bool:
+        """小文件快速复制（不分块）"""
+        try:
+            dst_dir = os.path.dirname(dst_path)
+            if dst_dir:
+                os.makedirs(dst_dir, exist_ok=True)
+            shutil.copy2(src_path, dst_path)
+            return True
+        except Exception as e:
+            if self.log_callback:
+                self.log_callback(f"[错误] 复制失败 {os.path.basename(src_path)}: {str(e)}")
+            return False
+    
+    def pause(self):
+        """暂停传输"""
+        with self._lock:
+            self._is_paused = True
+        self.file_transfer.pause()
+        if self.log_callback:
+            self.log_callback("[暂停] 目录传输已暂停")
+    
+    def resume(self):
+        """继续传输"""
+        with self._lock:
+            self._is_paused = False
+        self.file_transfer.resume()
+        if self.log_callback:
+            self.log_callback("[继续] 恢复目录传输")
+    
+    def stop(self):
+        """停止传输"""
+        with self._lock:
+            self._is_stopped = True
+        self.file_transfer.stop()
+        if self.log_callback:
+            self.log_callback("[停止] 目录传输已停止")
+    
+    def transfer_directory(self, src_dir: str, dst_dir: str, progress_file: str = None) -> dict:
+        """传输整个目录（支持断点续传、几万文件批量）
+        
+        Args:
+            src_dir: 源目录
+            dst_dir: 目标目录
+            progress_file: 进度文件路径，默认在源目录下
+        """
+        if not os.path.exists(src_dir):
+            raise FileNotFoundError(f"源目录不存在: {src_dir}")
+        
+        dir_key = self.get_dir_key(src_dir, dst_dir)
+        
+        # 设置进度文件
+        if not progress_file:
+            progress_file = os.path.join(src_dir, ".directory_transfer_progress.json")
+        self.file_transfer.set_progress_file(progress_file)
+        
+        # 扫描目录
+        file_list, total_files, total_size = self.scan_directory(src_dir)
+        if total_files == 0:
+            if self.log_callback:
+                self.log_callback("[警告] 源目录为空")
+            return {'success': True, 'total_files': 0, 'completed_files': 0}
+        
+        # 获取已完成的文件列表（从进度文件恢复）
+        dir_progress = self.file_transfer.progress_manager.get_directory_progress(dir_key)
+        completed_files = set(dir_progress.get('completed_files', []))
+        failed_files = set(dir_progress.get('failed_files', []))
+        
+        # 更新目录总信息
+        self.file_transfer.progress_manager.set_directory_info(
+            dir_key, total_files, total_size
+        )
+        
+        if self.log_callback:
+            if completed_files:
+                self.log_callback(f"[恢复] 从进度文件恢复，已完成 {len(completed_files)} 个文件")
+            else:
+                self.log_callback(f"[开始] 目录传输，共 {total_files} 个文件")
+        
+        # 计算需要传输的文件
+        files_to_transfer = [f for f in file_list if f not in completed_files]
+        skipped_count = total_files - len(files_to_transfer)
+        
+        if skipped_count > 0 and self.log_callback:
+            self.log_callback(f"[跳过] {skipped_count} 个文件已完成传输")
+        
+        completed_count = len(completed_files)
+        failed_count = len(failed_files)
+        total_completed_size = 0
+        
+        # 开始传输
+        for src_file in files_to_transfer:
+            # 检查停止状态
+            with self._lock:
+                if self._is_stopped:
+                    break
+            
+            # 等待暂停解除
+            while True:
+                with self._lock:
+                    if not self._is_paused or self._is_stopped:
+                        break
+                time.sleep(0.1)
+            
+            # 计算相对路径，保持目录结构
+            rel_path = os.path.relpath(src_file, src_dir)
+            dst_file = os.path.join(dst_dir, rel_path)
+            
+            file_size = os.path.getsize(src_file)
+            
+            # 小文件直接复制，大文件用分块断点续传
+            if file_size < self.SKIP_CHUNK_THRESHOLD:
+                if self.log_callback:
+                    self.log_callback(f"[复制] {rel_path} ({format_file_size(file_size)})")
+                success = self.fast_copy_file(src_file, dst_file)
+                if success:
+                    completed_count += 1
+                    total_completed_size += file_size
+                    self.file_transfer.progress_manager.mark_file_complete(dir_key, src_file)
+                else:
+                    failed_count += 1
+            else:
+                # 大文件用分块传输
+                if self.log_callback:
+                    self.log_callback(f"[传输] {rel_path} ({format_file_size(file_size)})")
+                
+                # 设置单个文件进度回调
+                if self.file_progress_callback:
+                    original_callback = self.file_transfer.progress_callback
+                    def wrap_callback(f_path, completed, total, f_size):
+                        self.file_progress_callback(src_file, rel_path, completed, total, f_size)
+                    self.file_transfer.progress_callback = wrap_callback
+                
+                result = self.file_transfer.transfer_file(src_file, dst_file)
+                
+                if result.get('success'):
+                    completed_count += 1
+                    total_completed_size += file_size
+                    self.file_transfer.progress_manager.mark_file_complete(dir_key, src_file)
+                else:
+                    failed_count += 1
+            
+            # 更新总体进度
+            if self.progress_callback:
+                self.progress_callback(src_dir, completed_count, total_files, total_size)
+            
+            # 每 100 个文件输出一次统计
+            if completed_count % 100 == 0 and completed_count > 0 and self.log_callback:
+                self.log_callback(f"[进度] 已完成 {completed_count}/{total_files} 个文件")
+        
+        # 最终结果
+        if self.log_callback:
+            self.log_callback(f"[完成] 目录传输结束")
+            self.log_callback(f"  - 成功: {completed_count} 个文件")
+            self.log_callback(f"  - 失败: {failed_count} 个文件")
+            self.log_callback(f"  - 跳过: {skipped_count} 个文件")
+        
+        return {
+            'success': True,
+            'total_files': total_files,
+            'completed_files': completed_count,
+            'failed_files': failed_count,
+            'skipped_files': skipped_count,
+            'total_size': total_size,
+            'completed_size': total_completed_size
+        }
+
+
 class ModernStyle:
     """现代深色主题配色"""
     # 主色调 - 深蓝色系
@@ -688,7 +949,7 @@ class FileTransferGUI:
     
     def __init__(self, root):
         self.root = root
-        self.root.title("超大文件断点续传搬运器 v2.2")
+        self.root.title("超大文件断点续传搬运器 v3.0")
         
         # 获取DPI缩放比例
         self.dpi_scale = DPIHelper.get_scaling_factor()
@@ -789,13 +1050,13 @@ class FileTransferGUI:
         file_card_pady = (0, DPIHelper.scale(15, self.dpi_scale))
         file_card.pack(fill=tk.X, pady=file_card_pady)
         
-        # 源文件行
+        # 源文件行 - 支持文件和目录两种选择
         row1 = tk.Frame(file_card, bg=ModernStyle.BG_CARD)
         row1_pady = (0, DPIHelper.scale(12, self.dpi_scale))
         row1.pack(fill=tk.X, pady=row1_pady)
         
         src_label_font = DPIHelper.get_scaled_font_size(10)
-        tk.Label(row1, text="📄 源文件", 
+        tk.Label(row1, text="📄 源文件/目录", 
                 font=(ModernStyle.FONT_FAMILY, src_label_font),
                 bg=ModernStyle.BG_CARD,
                 fg=ModernStyle.TEXT_SECONDARY,
@@ -805,12 +1066,19 @@ class FileTransferGUI:
         source_padx = (0, DPIHelper.scale(10, self.dpi_scale))
         self.source_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=source_padx)
         
-        self.browse_src_btn = RoundedButton(row1, text="浏览", command=self.browse_source,
+        self.browse_src_btn = RoundedButton(row1, text="浏览文件", command=self.browse_source,
                                            width=80, height=32,
                                            bg=ModernStyle.ACCENT_INFO,
                                            hover_bg=ModernStyle.BG_HOVER,
                                            dpi_scale=self.dpi_scale)
-        self.browse_src_btn.pack(side=tk.LEFT)
+        self.browse_src_btn.pack(side=tk.LEFT, padx=(0, 5))
+        
+        self.browse_dir_btn = RoundedButton(row1, text="浏览目录", command=self.browse_source_dir,
+                                          width=80, height=32,
+                                          bg=ModernStyle.ACCENT_PRIMARY,
+                                          hover_bg=ModernStyle.BG_HOVER,
+                                          dpi_scale=self.dpi_scale)
+        self.browse_dir_btn.pack(side=tk.LEFT)
         
         # 目标路径行
         row2 = tk.Frame(file_card, bg=ModernStyle.BG_CARD)
@@ -1030,6 +1298,13 @@ class FileTransferGUI:
             self.source_path.set(file_path)
             self.log(f"📄 已选择源文件: {os.path.basename(file_path)}")
     
+    def browse_source_dir(self):
+        """选择源目录"""
+        directory = filedialog.askdirectory(title="选择源目录")
+        if directory:
+            self.source_path.set(directory)
+            self.log(f"📂 已选择源目录: {directory}")
+    
     def browse_dest(self):
         """选择目标路径"""
         # 先问是文件还是目录
@@ -1125,12 +1400,88 @@ class FileTransferGUI:
     
     def _transfer_worker(self):
         """传输工作线程"""
-        src_file = self.source_path.get()
-        dst_file = self.dest_path.get()
+        src_path = self.source_path.get()
+        dst_path = self.dest_path.get()
         
-        if not src_file or not dst_file:
+        if not src_path or not dst_path:
             return
         
+        # 判断是文件还是目录
+        is_directory = os.path.isdir(src_path)
+        
+        if is_directory:
+            # ========== 目录传输 ==========
+            self._directory_transfer_worker(src_path, dst_path)
+        else:
+            # ========== 单文件传输 ==========
+            self._single_file_transfer_worker(src_path, dst_path)
+    
+    def _directory_transfer_worker(self, src_dir: str, dst_dir: str):
+        """目录传输工作线程"""
+        try:
+            chunk_size = int(self.chunk_size.get()) * 1024 * 1024
+            max_retry = int(self.retry_count.get())
+            heartbeat_interval = int(self.heartbeat.get())
+            
+            # 创建目录传输实例
+            dir_transfer = DirectoryTransfer(
+                self._update_directory_progress,
+                self.log,
+                self.log,
+                self._update_file_progress
+            )
+            
+            # 设置传输参数
+            dir_transfer.file_transfer.config.CHUNK_SIZE = chunk_size
+            dir_transfer.file_transfer.config.MAX_RETRY = max_retry
+            dir_transfer.file_transfer.config.HEARTBEAT_INTERVAL = heartbeat_interval
+            dir_transfer.file_transfer.config.validate()
+            
+            self.transfer = dir_transfer.file_transfer
+            self.directory_transfer = dir_transfer
+            
+            # 执行传输
+            result = dir_transfer.transfer_directory(src_dir, dst_dir)
+            
+            # 完成
+            if result.get('success'):
+                completed = result.get('completed_files', 0)
+                total = result.get('total_files', 0)
+                failed = result.get('failed_files', 0)
+                skipped = result.get('skipped_files', 0)
+                
+                self.status_text.set(f"目录传输完成: {completed}/{total} 个文件")
+                self.log(f"✅ [完成] 目录传输结束")
+                self.log(f"  成功: {completed} 个文件")
+                self.log(f"  失败: {failed} 个文件")
+                self.log(f"  跳过: {skipped} 个文件")
+                self.progress_bar.set_value(100)
+                
+        except Exception as e:
+            self.status_text.set(f"传输失败: {str(e)}")
+            self.log(f"❌ [错误] {str(e)}")
+            import traceback
+            self.log(traceback.format_exc())
+        finally:
+            self._enable_buttons()
+    
+    def _update_directory_progress(self, current_dir: str, completed: int, total: int, total_size: int):
+        """更新目录传输总体进度"""
+        percent = (completed / total * 100) if total > 0 else 0
+        self.progress_bar.set_value(percent)
+        self.status_text.set(f"目录传输中: {completed}/{total} 个文件 ({percent:.1f}%)")
+        self.root.update_idletasks()
+    
+    def _update_file_progress(self, full_path: str, rel_path: str, completed: int, total: int, file_size: int):
+        """更新目录传输中单个文件的进度（简化，避免日志刷屏）"""
+        # 只有在每 10% 或完成时才更新日志，避免刷屏
+        percent = (completed / total * 100) if total > 0 else 0
+        if percent >= 100 or completed % max(1, total // 10) == 0:
+            self.log(f"  → {rel_path}: {percent:.0f}%")
+        self.root.update_idletasks()
+    
+    def _single_file_transfer_worker(self, src_file: str, dst_file: str):
+        """单文件传输工作线程"""
         # 设置配置（使用实例变量避免影响全局配置）
         try:
             chunk_size = int(self.chunk_size.get()) * 1024 * 1024
@@ -1190,7 +1541,7 @@ class FileTransferGUI:
     def start_transfer(self):
         """开始传输"""
         if not self.source_path.get():
-            messagebox.showwarning("警告", "请先选择源文件!")
+            messagebox.showwarning("警告", "请先选择源文件或目录!")
             return
         
         if not self.dest_path.get():
@@ -1198,7 +1549,7 @@ class FileTransferGUI:
             return
         
         if not os.path.exists(self.source_path.get()):
-            messagebox.showerror("错误", "源文件不存在!")
+            messagebox.showerror("错误", "源路径不存在!")
             return
         
         # 更新按钮状态
@@ -1210,26 +1561,42 @@ class FileTransferGUI:
         self.transfer_thread.start()
     
     def pause_transfer(self):
-        """暂停传输"""
-        if self.transfer:
+        """暂停传输（支持文件和目录）"""
+        if hasattr(self, 'directory_transfer') and self.directory_transfer:
+            # 目录传输
+            self.directory_transfer.pause()
+            self.status_text.set("⏸ 目录传输已暂停")
+        elif self.transfer:
+            # 单文件传输
             self.transfer.pause()
-            self.pause_btn.set_state(True)
-            self.continue_btn.set_state(False)
             self.status_text.set("⏸ 已暂停")
+        
+        self.pause_btn.set_state(True)
+        self.continue_btn.set_state(False)
     
     def continue_transfer(self):
-        """继续传输"""
-        if self.transfer:
+        """继续传输（支持文件和目录）"""
+        if hasattr(self, 'directory_transfer') and self.directory_transfer:
+            # 目录传输
+            self.directory_transfer.resume()
+            self.status_text.set("▶ 继续目录传输...")
+        elif self.transfer:
+            # 单文件传输
             self.transfer.resume()
-            self.pause_btn.set_state(False)
-            self.continue_btn.set_state(True)
             self.status_text.set("▶ 继续传输...")
+        
+        self.pause_btn.set_state(False)
+        self.continue_btn.set_state(True)
+    
+    def _enable_buttons(self):
+        """启用按钮（传输完成后）"""
+        self.start_btn.set_state(False)
+        self.pause_btn.set_state(True)
+        self.continue_btn.set_state(True)
     
     def transfer_finished(self):
         """传输完成后的界面更新"""
-        self.start_btn.set_state(False)
-        self.pause_btn.set_state(True)
-        self.continue_btn.set_state(False)
+        self._enable_buttons()
 
 
 def main():
